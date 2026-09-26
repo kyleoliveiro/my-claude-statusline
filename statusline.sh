@@ -55,12 +55,13 @@ if [ -n "$cwd" ]; then
   while IFS= read -r line; do
     case "$line" in
       "# branch.head "*) branch="${line#\# branch.head }"; in_repo=1 ;;
-      "# branch."*) in_repo=1 ;;
       "# branch.ab "*)
         read -r _ _ a b <<< "$line"
         ahead="${a#+}"
         behind="${b#-}"
+        in_repo=1
         ;;
+      "# branch."*) in_repo=1 ;;
       "#"*) ;;
       *) dirty="*" ;;
     esac
