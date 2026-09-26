@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Claude Code status line
-# Reads JSON input on stdin and prints a single-line status.
+# Reads JSON input on stdin and prints a two-line status, with a per-session
+# snowflake right-aligned across both lines when the terminal is wide enough.
 
 # Extract every field in a single jq call, joined by the ASCII unit separator
 # (non-whitespace, so `read` keeps empty fields in place). Usage/limit fields
@@ -8,7 +9,7 @@
 # so they fall back to empty rather than failing when missing.
 US=$'\x1f'
 IFS="$US" read -r model cwd effort ctx_pct session_pct session_resets_at \
-  week_pct week_resets_at lines_added lines_removed < <(
+  week_pct week_resets_at lines_added lines_removed session_id < <(
   jq -r '
     def pct: if type == "number" then round else "" end;
     [
@@ -21,7 +22,8 @@ IFS="$US" read -r model cwd effort ctx_pct session_pct session_resets_at \
       (.rate_limits.seven_day.used_percentage | pct),
       (.rate_limits.seven_day.resets_at // ""),
       (.cost.total_lines_added // 0),
-      (.cost.total_lines_removed // 0)
+      (.cost.total_lines_removed // 0),
+      (.session_id // "")
     ] | map(tostring) | join("\u001f")
   '
 )
@@ -42,7 +44,9 @@ week_reset_str=""
 [ -n "$week_resets_at" ] && week_reset_str=$(fmt_time "$week_resets_at" "+%a %H:%M")
 
 # Git branch, dirty marker and ahead/behind from a single `git status` call,
-# skipping optional locks for safety/speed. Empty outside a repo.
+# skipping optional locks for safety/speed. Empty outside a repo; in_repo is
+# set from the "# branch.*" headers, which git always prints inside a repo.
+in_repo=""
 branch=""
 dirty=""
 ahead=0
@@ -50,7 +54,8 @@ behind=0
 if [ -n "$cwd" ]; then
   while IFS= read -r line; do
     case "$line" in
-      "# branch.head "*) branch="${line#\# branch.head }" ;;
+      "# branch.head "*) branch="${line#\# branch.head }"; in_repo=1 ;;
+      "# branch."*) in_repo=1 ;;
       "# branch.ab "*)
         read -r _ _ a b <<< "$line"
         ahead="${a#+}"
@@ -114,26 +119,134 @@ if [ -n "$branch" ]; then
   git_part="${COLOR_BRANCH}${branch}${COLOR_DIRTY}${dirty}${RESET}"
   [ "$ahead" -gt 0 ] 2>/dev/null && git_part="${git_part} ${COLOR_AHEAD}↑${ahead}${RESET}"
   [ "$behind" -gt 0 ] 2>/dev/null && git_part="${git_part} ${COLOR_BEHIND}↓${behind}${RESET}"
+elif [ -n "$cwd" ] && [ -z "$in_repo" ]; then
+  git_part="${DIM}no git${RESET}"
 fi
 
-parts=()
-[ -n "$model" ] && parts+=("${COLOR_MODEL}${model}${RESET}")
-[ -n "$effort" ] && parts+=("${COLOR_EFFORT}${effort}${RESET}")
-[ -n "$ctx_pct" ] && meter ctx "$ctx_pct" "$COLOR_CTX" && parts+=("$meter")
-[ -n "$session_pct" ] && meter 5h "$session_pct" "$COLOR_SESSION" "$session_reset_str" && parts+=("$meter")
-[ -n "$week_pct" ] && meter wk "$week_pct" "$COLOR_WEEK" "$week_reset_str" && parts+=("$meter")
+# Render a seeded 7x4-pixel snowflake as two rows of 7 half-block cells into
+# $flake1/$flake2 (ANSI colors embedded). Mirrored left/right and
+# top/bottom: each pixel folds to (dx, dy) in a 4x2 quadrant, dx = distance
+# from the centre column (0-3), dy = 0 for the inner rows, 1 for the outer.
+flake() {
+  # Random bytes come from the md5 of the seed string (md5sum on Linux, md5 on macOS).
+  local hash pos=0 r dx dy x y q=() cell top bot row col
+  hash=$(printf '%s' "$1" | { md5sum 2>/dev/null || md5; } | cut -c1-32)
+  [ ${#hash} -eq 32 ] || return 1
+  rnd() { r=$(( 16#${hash:pos:2} )); pos=$(( (pos + 2) % 32 )); }
+  # Centre column is always the vertical spine. The other 6 quadrant cells
+  # (dx 1-3, both rows) take one of the masks with 1-3 bits set: enough to
+  # branch, sparse enough never to blob.
+  local masks=() m n i
+  for ((m = 1; m < 64; m++)); do
+    n=0
+    for ((i = 0; i < 6; i++)); do n=$(( n + (m >> i & 1) )); done
+    [ $n -le 3 ] && masks+=($m)
+  done
+  rnd; m=${masks[r % ${#masks[@]}]}
+  for ((dy = 0; dy < 2; dy++)); do
+    q[dy*4]=1
+    for ((dx = 1; dx < 4; dx++)); do
+      q[dy*4+dx]=$(( m >> (dy * 3 + dx - 1) & 1 ))
+    done
+  done
+  # Pixel (x, y) on the 7x4 grid -> $pc: its 256-color, or empty when off.
+  # Colors radiate from the centre: ring = dx + dy (0-4) indexes a run of the
+  # rainbow whose start, direction and spacing come from the seed.
+  local rainbow=(196 202 208 214 220 226 190 154 118 82 46 48 50 51 45 39 33 27 21 57 93 129 165 201 199 197)
+  local nr=${#rainbow[@]} start dir step ring=()
+  rnd; start=$(( r % nr ))
+  rnd; dir=$(( r & 1 ? 1 : -1 ))
+  rnd; step=$(( 2 + r % 3 ))
+  for ((i = 0; i < 5; i++)); do
+    ring[i]=${rainbow[( (start + dir * step * i) % nr + nr ) % nr]}
+  done
+  px() {
+    local dx=$(( $1 < 3 ? 3 - $1 : $1 - 3 )) dy=$(( $2 == 0 || $2 == 3 ))
+    pc=""
+    [ "${q[dy*4+dx]}" = 1 ] && pc=${ring[dx + dy]}
+  }
+  # Each cell is one half-block glyph: top pixel in the foreground, bottom in
+  # the background when both are lit in different colors.
+  flake1="" flake2=""
+  local tc bc
+  for ((row = 0; row < 2; row++)); do
+    local line=""
+    for ((x = 0; x < 7; x++)); do
+      px $x $(( row * 2 )); tc=$pc
+      px $x $(( row * 2 + 1 )); bc=$pc
+      if [ -n "$tc" ] && [ -n "$bc" ]; then
+        if [ "$tc" = "$bc" ]; then
+          line+="\033[38;5;${tc}m█\033[0m"
+        else
+          line+="\033[38;5;${tc};48;5;${bc}m▀\033[0m"
+        fi
+      elif [ -n "$tc" ]; then
+        line+="\033[38;5;${tc}m▀\033[0m"
+      elif [ -n "$bc" ]; then
+        line+="\033[38;5;${bc}m▄\033[0m"
+      else
+        line+=" "
+      fi
+    done
+    [ $row -eq 0 ] && flake1=$line || flake2=$line
+  done
+}
+
+# Join args with $SEP into $joined.
+join_parts() {
+  local out="" p
+  for p in "$@"; do
+    out="${out:+${out}${SEP}}${p}"
+  done
+  joined=$out
+}
+
+# Line 1: who/where — model, effort, dir, git, lines changed.
+line1=()
+[ -n "$model" ] && line1+=("${COLOR_MODEL}${model}${RESET}")
+[ -n "$effort" ] && line1+=("${COLOR_EFFORT}${effort}${RESET}")
+[ -n "$dir_name" ] && line1+=("${COLOR_DIR}${dir_name}${RESET}")
+[ -n "$git_part" ] && line1+=("$git_part")
 { [ "$lines_added" -gt 0 ] || [ "$lines_removed" -gt 0 ]; } 2>/dev/null && \
-  parts+=("${COLOR_ADD}+${lines_added}${RESET} ${COLOR_DEL}-${lines_removed}${RESET}")
-[ -n "$dir_name" ] && parts+=("${COLOR_DIR}${dir_name}${RESET}")
-[ -n "$git_part" ] && parts+=("$git_part")
+  line1+=("${COLOR_ADD}+${lines_added}${RESET} ${COLOR_DEL}-${lines_removed}${RESET}")
 
-output=""
-for i in "${!parts[@]}"; do
-  if [ "$i" -eq 0 ]; then
-    output="${parts[$i]}"
-  else
-    output="${output}${SEP}${parts[$i]}"
+# Line 2: usage meters.
+line2=()
+[ -n "$ctx_pct" ] && meter ctx "$ctx_pct" "$COLOR_CTX" && line2+=("$meter")
+[ -n "$session_pct" ] && meter 5h "$session_pct" "$COLOR_SESSION" "$session_reset_str" && line2+=("$meter")
+[ -n "$week_pct" ] && meter wk "$week_pct" "$COLOR_WEEK" "$week_reset_str" && line2+=("$meter")
+
+join_parts "${line1[@]}"
+out1=$joined
+out2=""
+[ "${#line2[@]}" -gt 0 ] && join_parts "${line2[@]}" && out2=$joined
+
+# Visible width of a %b-formatted string (ANSI stripped, UTF-8 chars counted).
+vis_width() {
+  # Count characters, not bytes, even if the inherited locale isn't UTF-8.
+  local plain LC_ALL=C.UTF-8
+  plain=$(printf '%b' "$1" | sed $'s/\x1b\\[[0-9;]*m//g')
+  vis=${#plain}
+}
+
+# Session snowflake, right-aligned across both rows. Progressive enhancement:
+# skipped when COLUMNS is unknown or the lines leave no room for it.
+FLAKE_W=7
+FLAKE_GAP=2    # min spaces between text and flake
+# Claude Code indents the status line 2 columns and truncates overflow with
+# "…" at about COLUMNS-4 visible chars; 5 keeps the flake clear of that edge.
+FLAKE_MARGIN=5
+if [ -n "$session_id" ] && [ "${COLUMNS:-0}" -gt 0 ] && flake "$session_id"; then
+  vis_width "$out1"; w1=$vis
+  vis_width "$out2"; w2=$vis
+  widest=$(( w1 > w2 ? w1 : w2 ))
+  flake_col=$(( COLUMNS - FLAKE_MARGIN - FLAKE_W ))
+  if [ $(( widest + FLAKE_GAP )) -le "$flake_col" ]; then
+    out1="${out1}$(printf '%*s' $(( flake_col - w1 )) '')${flake1}"
+    out2="${out2}$(printf '%*s' $(( flake_col - w2 )) '')${flake2}"
   fi
-done
+fi
 
-printf "%b\n" "$output"
+printf "%b\n" "$out1"
+[ -n "$out2" ] && printf "%b\n" "$out2"
+exit 0
