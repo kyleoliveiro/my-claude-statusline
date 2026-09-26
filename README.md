@@ -6,11 +6,12 @@ A compact, colorful status line for [Claude Code](https://claude.com/claude-code
 
 ## What it shows
 
-The status line spans two rows:
+The status line spans two rows, with the session snowflake (see the
+screenshot) right-aligned beside them:
 
 ```
-Opus 5.5 1M | high | my-app | main* ↑2 | +128 -37           ▄▄ █ ▄▄
-ctx ━━━━ 42% | 5h ━━━━ 31% (21:45) | wk ━━━━ 74% (Wed 07:05)  ▀▀ █ ▀▀
+Opus 5.5 1M | high | my-app | main* ↑2 | +128 -37
+ctx ━━━━━━━━ 42% | 5h ━━━━━━━━ 31% (21:45) | wk ━━━━━━━━ 74% (Wed 07:05)
 ```
 
 **Row 1: session and location**
