@@ -9,7 +9,8 @@
 # so they fall back to empty rather than failing when missing.
 US=$'\x1f'
 IFS="$US" read -r model cwd effort ctx_pct session_pct session_resets_at \
-  week_pct week_resets_at lines_added lines_removed session_id < <(
+  week_pct week_resets_at lines_added lines_removed session_id cost_usd \
+  cache_requests cache_warm cache_expires_at < <(
   jq -r '
     def pct: if type == "number" then round else "" end;
     [
@@ -23,7 +24,11 @@ IFS="$US" read -r model cwd effort ctx_pct session_pct session_resets_at \
       (.rate_limits.seven_day.resets_at // ""),
       (.cost.total_lines_added // 0),
       (.cost.total_lines_removed // 0),
-      (.session_id // "")
+      (.session_id // ""),
+      (.cost.total_cost_usd // ""),
+      (.prompt_cache.requests // ""),
+      (.prompt_cache.warm // ""),
+      (.prompt_cache.expires_at // "")
     ] | map(tostring) | join("\u001f")
   '
 )
@@ -42,6 +47,24 @@ session_reset_str=""
 [ -n "$session_resets_at" ] && session_reset_str=$(fmt_time "$session_resets_at" "+%H:%M")
 week_reset_str=""
 [ -n "$week_resets_at" ] && week_reset_str=$(fmt_time "$week_resets_at" "+%a %H:%M")
+
+# Session cost, e.g. "$0.35"; C locale so the decimal point is always ".".
+cost_str=""
+[ -n "$cost_usd" ] && cost_str=$(LC_ALL=C printf '$%.2f' "$cost_usd" 2>/dev/null)
+[ "$cost_str" = '$0.00' ] && cost_str=""
+
+# Prompt cache: minutes until the cached prefix expires, or "cold" once it has.
+# Hidden before the first request, when there's nothing cached yet.
+cache_mins=""
+cache_cold=""
+if [ "${cache_requests:-0}" -gt 0 ] 2>/dev/null; then
+  now=$(date +%s)
+  if [ "$cache_warm" = "true" ] && [ "${cache_expires_at:-0}" -gt "$now" ] 2>/dev/null; then
+    cache_mins=$(( (cache_expires_at - now) / 60 ))
+  else
+    cache_cold=1
+  fi
+fi
 
 # Git branch, dirty marker and ahead/behind from a single `git status` call,
 # skipping optional locks for safety/speed. Empty outside a repo; in_repo is
@@ -84,6 +107,8 @@ COLOR_BRANCH="\033[32m"  # green
 COLOR_DIRTY="\033[31m"   # red
 COLOR_AHEAD="\033[36m"   # cyan
 COLOR_BEHIND="\033[31m"  # red
+COLOR_COST="\033[97m"    # bright white
+COLOR_CACHE="\033[96m"   # bright cyan
 RESET="\033[0m"
 DIM="\033[2m"
 SEP=" \033[2m|\033[0m "
@@ -92,6 +117,7 @@ COLOR_TRACK="\033[38;5;243m" # mid grey (256-color, theme-independent) for unfil
 WARN_PCT=70
 CRIT_PCT=90
 BAR_WIDTH=8
+CACHE_WARN_MINS=5 # cache countdown turns yellow below this
 
 # Render a usage meter into $meter: meter <label> <pct> <base color> [suffix].
 # The bar and percentage switch to warn/crit colors as usage climbs; the label
@@ -109,7 +135,9 @@ meter() {
   empty=$(( BAR_WIDTH - filled ))
   for ((i = 0; i < filled; i++)); do f+="━"; done
   for ((i = 0; i < empty; i++)); do e+="━"; done
-  meter="${base}${DIM}${label}${RESET} ${color}${f}${RESET}${COLOR_TRACK}${e}${RESET} ${color}${pct}%${RESET}"
+  meter="${base}${DIM}${label}${RESET} "
+  [ "$BAR_WIDTH" -gt 0 ] && meter+="${color}${f}${RESET}${COLOR_TRACK}${e}${RESET} "
+  meter+="${color}${pct}%${RESET}"
   [ -n "$suffix" ] && meter="${meter} ${DIM}(${suffix})${RESET}"
   return 0
 }
@@ -202,25 +230,46 @@ join_parts() {
   joined=$out
 }
 
-# Line 1: who/where — model, effort, dir, git, lines changed.
-line1=()
-[ -n "$model" ] && line1+=("${COLOR_MODEL}${model}${RESET}")
-[ -n "$effort" ] && line1+=("${COLOR_EFFORT}${effort}${RESET}")
-[ -n "$dir_name" ] && line1+=("${COLOR_DIR}${dir_name}${RESET}")
-[ -n "$git_part" ] && line1+=("$git_part")
-{ [ "$lines_added" -gt 0 ] || [ "$lines_removed" -gt 0 ]; } 2>/dev/null && \
-  line1+=("${COLOR_ADD}+${lines_added}${RESET} ${COLOR_DEL}-${lines_removed}${RESET}")
+# Line 1: who/where — model, effort, dir, git, lines changed, cost, cache.
+# Detail levels 0-4 drop, in order: cache, lines changed, effort, cost.
+build_line1() {
+  local level=$1 parts=()
+  [ -n "$model" ] && parts+=("${COLOR_MODEL}${model}${RESET}")
+  [ -n "$effort" ] && [ "$level" -lt 3 ] && parts+=("${COLOR_EFFORT}${effort}${RESET}")
+  [ -n "$dir_name" ] && parts+=("${COLOR_DIR}${dir_name}${RESET}")
+  [ -n "$git_part" ] && parts+=("$git_part")
+  if [ "$level" -lt 2 ] && { [ "$lines_added" -gt 0 ] || [ "$lines_removed" -gt 0 ]; } 2>/dev/null; then
+    parts+=("${COLOR_ADD}+${lines_added}${RESET} ${COLOR_DEL}-${lines_removed}${RESET}")
+  fi
+  [ -n "$cost_str" ] && [ "$level" -lt 4 ] && parts+=("${COLOR_COST}${cost_str}${RESET}")
+  if [ "$level" -lt 1 ]; then
+    if [ -n "$cache_mins" ]; then
+      local c=$COLOR_CACHE m="${cache_mins}m"
+      [ "$cache_mins" -lt "$CACHE_WARN_MINS" ] && c=$COLOR_WARN
+      [ "$cache_mins" -lt 1 ] && m="<1m"
+      parts+=("${c}${DIM}cache${RESET} ${c}${m}${RESET}")
+    elif [ -n "$cache_cold" ]; then
+      parts+=("${DIM}cache cold${RESET}")
+    fi
+  fi
+  join_parts "${parts[@]}"
+}
 
-# Line 2: usage meters.
-line2=()
-[ -n "$ctx_pct" ] && meter ctx "$ctx_pct" "$COLOR_CTX" && line2+=("$meter")
-[ -n "$session_pct" ] && meter 5h "$session_pct" "$COLOR_SESSION" "$session_reset_str" && line2+=("$meter")
-[ -n "$week_pct" ] && meter wk "$week_pct" "$COLOR_WEEK" "$week_reset_str" && line2+=("$meter")
-
-join_parts "${line1[@]}"
-out1=$joined
-out2=""
-[ "${#line2[@]}" -gt 0 ] && join_parts "${line2[@]}" && out2=$joined
+# Line 2: usage meters. Detail levels 0-3: drop reset times, then halve the
+# bars, then drop the bars entirely.
+build_line2() {
+  local level=$1 parts=() s5="$session_reset_str" swk="$week_reset_str"
+  local BAR_WIDTH=$BAR_WIDTH
+  [ "$level" -ge 1 ] && s5="" swk=""
+  [ "$level" -ge 2 ] && BAR_WIDTH=$(( BAR_WIDTH / 2 ))
+  [ "$level" -ge 3 ] && BAR_WIDTH=0
+  [ -n "$ctx_pct" ] && meter ctx "$ctx_pct" "$COLOR_CTX" && parts+=("$meter")
+  [ -n "$session_pct" ] && meter 5h "$session_pct" "$COLOR_SESSION" "$s5" && parts+=("$meter")
+  [ -n "$week_pct" ] && meter wk "$week_pct" "$COLOR_WEEK" "$swk" && parts+=("$meter")
+  joined=""
+  [ "${#parts[@]}" -gt 0 ] && join_parts "${parts[@]}"
+  return 0
+}
 
 # Visible width of a %b-formatted string (ANSI stripped, UTF-8 chars counted).
 vis_width() {
@@ -230,18 +279,34 @@ vis_width() {
   vis=${#plain}
 }
 
+# Claude Code indents the status line 2 columns and truncates overflow with
+# "…" at about COLUMNS-4 visible chars; keep this many columns free.
+RIGHT_MARGIN=5
+
+# Build a line at the lowest detail level that fits: fit_line <builder> <max>.
+# Without a known width, always use full detail.
+fit_line() {
+  local builder=$1 max=$2 level
+  for ((level = 0; level <= max; level++)); do
+    "$builder" "$level"
+    [ "${COLUMNS:-0}" -gt 0 ] || return 0
+    vis_width "$joined"
+    [ "$vis" -le $(( COLUMNS - RIGHT_MARGIN )) ] && return 0
+  done
+  return 0 # still too long at minimum detail; let Claude Code truncate
+}
+fit_line build_line1 4; out1=$joined
+fit_line build_line2 3; out2=$joined
+
 # Session snowflake, right-aligned across both rows. Progressive enhancement:
 # skipped when COLUMNS is unknown or the lines leave no room for it.
 FLAKE_W=7
-FLAKE_GAP=2    # min spaces between text and flake
-# Claude Code indents the status line 2 columns and truncates overflow with
-# "…" at about COLUMNS-4 visible chars; 5 keeps the flake clear of that edge.
-FLAKE_MARGIN=5
+FLAKE_GAP=2 # min spaces between text and flake
 if [ -n "$session_id" ] && [ "${COLUMNS:-0}" -gt 0 ] && flake "$session_id"; then
   vis_width "$out1"; w1=$vis
   vis_width "$out2"; w2=$vis
   widest=$(( w1 > w2 ? w1 : w2 ))
-  flake_col=$(( COLUMNS - FLAKE_MARGIN - FLAKE_W ))
+  flake_col=$(( COLUMNS - RIGHT_MARGIN - FLAKE_W ))
   if [ $(( widest + FLAKE_GAP )) -le "$flake_col" ]; then
     out1="${out1}$(printf '%*s' $(( flake_col - w1 )) '')${flake1}"
     out2="${out2}$(printf '%*s' $(( flake_col - w2 )) '')${flake2}"
