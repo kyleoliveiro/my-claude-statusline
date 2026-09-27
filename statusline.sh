@@ -53,6 +53,11 @@ cost_str=""
 [ -n "$cost_usd" ] && cost_str=$(LC_ALL=C printf '$%.2f' "$cost_usd" 2>/dev/null)
 [ "$cost_str" = '$0.00' ] && cost_str=""
 
+# Logged-in account email. Not part of the stdin JSON, so read it from Claude
+# Code's config file; empty when logged in with an API key instead.
+account_email=$(jq -r '.oauthAccount.emailAddress // empty' \
+  "${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json" 2>/dev/null)
+
 # Prompt cache: minutes until the cached prefix expires, or "cold" once it has.
 # Hidden before the first request, when there's nothing cached yet.
 cache_mins=""
@@ -109,6 +114,7 @@ COLOR_AHEAD="\033[36m"   # cyan
 COLOR_BEHIND="\033[31m"  # red
 COLOR_COST="\033[97m"    # bright white
 COLOR_CACHE="\033[96m"   # bright cyan
+COLOR_ACCOUNT="\033[37m" # light grey
 RESET="\033[0m"
 DIM="\033[2m"
 SEP=" \033[2m|\033[0m "
@@ -116,7 +122,7 @@ COLOR_TRACK="\033[38;5;243m" # mid grey (256-color, theme-independent) for unfil
 
 WARN_PCT=70
 CRIT_PCT=90
-BAR_WIDTH=8
+BAR_WIDTH=5
 CACHE_WARN_MINS=5 # cache countdown turns yellow below this
 
 # Render a usage meter into $meter: meter <label> <pct> <base color> [suffix].
@@ -255,17 +261,21 @@ build_line1() {
   join_parts "${parts[@]}"
 }
 
-# Line 2: usage meters. Detail levels 0-3: drop reset times, then halve the
-# bars, then drop the bars entirely.
+# Line 2: usage meters, then the account they belong to. Detail levels 0-4:
+# drop reset times, then the account, then halve the bars, then drop the bars
+# entirely.
 build_line2() {
   local level=$1 parts=() s5="$session_reset_str" swk="$week_reset_str"
   local BAR_WIDTH=$BAR_WIDTH
   [ "$level" -ge 1 ] && s5="" swk=""
-  [ "$level" -ge 2 ] && BAR_WIDTH=$(( BAR_WIDTH / 2 ))
-  [ "$level" -ge 3 ] && BAR_WIDTH=0
+  [ "$level" -ge 3 ] && BAR_WIDTH=$(( BAR_WIDTH / 2 ))
+  [ "$level" -ge 4 ] && BAR_WIDTH=0
   [ -n "$ctx_pct" ] && meter ctx "$ctx_pct" "$COLOR_CTX" && parts+=("$meter")
   [ -n "$session_pct" ] && meter 5h "$session_pct" "$COLOR_SESSION" "$s5" && parts+=("$meter")
   [ -n "$week_pct" ] && meter wk "$week_pct" "$COLOR_WEEK" "$swk" && parts+=("$meter")
+  # Only alongside meters, so the email never makes up row 2 on its own.
+  [ -n "$account_email" ] && [ "$level" -lt 2 ] && [ "${#parts[@]}" -gt 0 ] &&
+    parts+=("${COLOR_ACCOUNT}${account_email}${RESET}")
   joined=""
   [ "${#parts[@]}" -gt 0 ] && join_parts "${parts[@]}"
   return 0
@@ -296,7 +306,7 @@ fit_line() {
   return 0 # still too long at minimum detail; let Claude Code truncate
 }
 fit_line build_line1 4; out1=$joined
-fit_line build_line2 3; out2=$joined
+fit_line build_line2 4; out2=$joined
 
 # Session snowflake, right-aligned across both rows. Progressive enhancement:
 # skipped when COLUMNS is unknown or the lines leave no room for it.

@@ -11,7 +11,7 @@ screenshot) right-aligned beside them:
 
 ```
 Opus 5.5 1M | high | my-app | main* ↑2 | +128 -37 | $1.84 | cache 42m
-ctx ━━━━━━━━ 42% | 5h ━━━━━━━━ 31% (21:45) | wk ━━━━━━━━ 74% (Wed 07:05)
+ctx ━━━━━ 42% | 5h ━━━━━ 31% (21:45) | wk ━━━━━ 74% (Wed 07:05) | you@example.com
 ```
 
 **Row 1: session and location**
@@ -33,6 +33,7 @@ ctx ━━━━━━━━ 42% | 5h ━━━━━━━━ 31% (21:45) | wk 
 | Context | `ctx ━━━━ 42%` | Context window usage |
 | 5-hour limit | `5h ━━━━ 31% (21:45)` | Usage and local reset time |
 | Weekly limit | `wk ━━━━ 74% (Wed 07:05)` | Usage and reset day/time |
+| Account | `you@example.com` | Email of the logged-in Claude account, read from `~/.claude.json`; hidden when using an API key |
 
 **Session snowflake**
 
@@ -48,9 +49,9 @@ simply left out.
 
 Rather than letting Claude Code cut lines off with `…`, each row sheds
 detail until it fits. Row 1 drops the cache timer, then lines changed, then
-effort, then cost. Row 2 drops the reset times, then halves the bars, then
-drops the bars entirely. The snowflake only appears when there's room left
-over at full detail.
+effort, then cost. Row 2 drops the reset times, then the account email,
+then halves the bars, then drops the bars entirely. The snowflake only
+appears when there's room left over at full detail.
 
 Usage bars turn yellow at 70% and red at 90%. The rate-limit segments only
 appear on Claude subscription plans, once the first response has come back.
